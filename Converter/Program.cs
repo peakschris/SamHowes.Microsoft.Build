@@ -54,9 +54,12 @@ namespace Converter
             await processor.UpdateResultsCache();
             Commit("Allow overriding of methods in the results cache");
 
+            await processor.DisableCLS();
+            Commit("Disable CLS compliance");
+
             try
             {
-                processor.SetVersion("17.0.0");
+                processor.SetVersion("17.11.0");
                 Commit("Set our version number");
             }
             catch
@@ -96,6 +99,7 @@ namespace Converter
         private readonly string _srcRoot;
         private readonly string _sharedRoot;
         private readonly string _frameworkRoot;
+        private readonly string _buildRoot;
         private readonly Files _files;
 
         public Processor(string repoRoot, string msbuildRoot, Files files)
@@ -105,12 +109,13 @@ namespace Converter
             _files = files;
             _srcRoot = Path.Combine(msbuildRoot, "src");
             _sharedRoot = Path.Combine(_srcRoot, "Shared");
-            _frameworkRoot = Path.Combine(_srcRoot, "Build");
+            _frameworkRoot = Path.Combine(_srcRoot, "Framework");
+            _buildRoot = Path.Combine(_srcRoot, "Build");
         }
 
         public void Publicize()
         {
-            var targetDirectories = new[] { _frameworkRoot, _sharedRoot };
+            var targetDirectories = new[] { _frameworkRoot, _sharedRoot, _buildRoot };
 
             bool replaced = false;
 
@@ -150,7 +155,7 @@ namespace Converter
             var flags = RegexOptions.Compiled | RegexOptions.Multiline | RegexOptions.IgnoreCase;
             var regexes = new[]
             {
-                (new Regex(@"^(?<indent>\s+)(?<modifier>(static|sealed|abstract|protected)\s)?internal(?<suffix>\s)(?<accessor>set)?", flags),
+                (new Regex(@"^(?<indent>\s*)(?<modifier>(static|sealed|abstract|protected)\s)?internal(?<suffix>\s)(?<accessor>set)?", flags),
                     (MatchEvaluator)MakePublic),
                 (new Regex(@"(?<qualifier>System.Reflection.)?BindingFlags.NonPublic", flags),
                     (MatchEvaluator)SearchForPublic)
@@ -166,7 +171,14 @@ namespace Converter
                 "Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs",
                 "Build/BackEnd/Components/Communications/NodeProviderOutOfProc.cs",
                 "Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs",
+                "Build/BackEnd/Components/Communications/ServerNodeEndpointOutOfProc.cs",
+                "Build/BackEnd/Node/OutOfProcServerNode.cs",
                 "Build/BackEnd/Node/NativeMethods.cs",
+                "Framework/NativeMethods.cs",
+                // "Framework/ITranslator.cs",
+                // "Framework/ITranslatable.cs",
+                // "Framework/BinaryTranslator.cs",
+                // "Framework/BuildException/BuildExceptionBase.cs",
             }.Select(f => Path.Combine(_srcRoot, f)));
 
             void Walk(string directory)
@@ -176,7 +188,8 @@ namespace Converter
                 foreach (var file in _files.GetFiles(directory))
                 {
                     if (!file.EndsWith(".cs")) continue;
-                    if (blockList.Contains(file)) continue;
+                    var normalizedFile = file.Replace('\\', '/');
+                    if (blockList.Any(blocked => normalizedFile.EndsWith(blocked.Replace('\\', '/')))) continue;
                     var contents = _files.GetContents(file);
                     replaced = false;
                     foreach (var (regex, evaluator) in regexes!)
@@ -195,7 +208,7 @@ namespace Converter
 
         public void SetPackageId()
         {
-            var xml = ProjectRootElement.Open(Path.Combine(_frameworkRoot, "Microsoft.Build.csproj"),
+            var xml = ProjectRootElement.Open(Path.Combine(_buildRoot, "Microsoft.Build.csproj"),
                 ProjectCollection.GlobalProjectCollection,
                 preserveFormatting: true)!;
             var group = xml.PropertyGroups.First();
@@ -218,13 +231,27 @@ namespace Converter
             {
                 noWarn.Value,
                 // warnings for naming things, CLS-compliance, and parameters in xml comments
-                "CS3001;CS3002;CS3003;CS3005;CS3008;CS1573",
+                "CS0050;CS0051;CS3001;CS3002;CS3003;CS3005;CS3008;CS1573;CS3021",
                 // CLS-compliant field 'ProjectCacheService.DesignTimeBuildsDetected' cannot be volatile
                 // we're not doing designtime builds, and there is a todo in the code to remove this property anyways
                 "CS3026"
             });
             GetOrAddProperty("PackageId").Value = "SamHowes.Microsoft.Build";
+            // GetOrAddProperty("AssemblyName").Value = "SamHowes.Microsoft.Build";
+            GetOrAddProperty("EnablePackageValidation").Value = "false";
+            
             xml.Save();
+
+            // Open the csproj as text and replace:
+            // Replace this line:
+            // internal sealed partial class NuGetFrameworkWrapper
+            // with:
+            // public sealed partial class NuGetFrameworkWrapper
+            var path = Path.Combine(_buildRoot, "Microsoft.Build.csproj");
+            var contents = _files.GetContents(path);
+            var regex = new Regex(@"(\s*)internal(\s+sealed\s+partial\s+class\s+NuGetFrameworkWrapper)");
+            contents = regex.Replace(contents, "$1public$2");
+            _files.WriteContents(path, contents);
         }
 
         public async Task UpdateTranslator()
@@ -238,7 +265,7 @@ namespace Converter
 
         private async Task CustomizeTranslator(Editor wrapper)
         {
-            var path = Path.Combine(_sharedRoot, "BinaryTranslator.cs");
+            var path = Path.Combine(_frameworkRoot, "BinaryTranslator.cs");
             var (root, editor) = await wrapper.LoadDocument(path);
 
             var classes = root.DescendantNodes()
@@ -328,6 +355,37 @@ namespace Converter
             await Write(editor, path);
         }
 
+        public async Task DisableCLS()
+        {
+            var _ = typeof(Microsoft.CodeAnalysis.CSharp.Formatting.CSharpFormattingOptions);
+
+            var wrapper = new Editor();
+            var path = Path.Combine(_frameworkRoot, "Properties/AssemblyInfo.cs");
+            await DisableCLSAssemblyInfo(wrapper, path);
+            var path2 = Path.Combine(_buildRoot, "AssemblyInfo.cs");
+            await DisableCLSAssemblyInfo(wrapper, path2);
+        }
+
+        private async Task DisableCLSAssemblyInfo(Editor wrapper, string path)
+        {
+            var (root, editor) = await wrapper.LoadDocument(path);
+            // Change: [assembly: CLSCompliant(true)]
+            // To:     [assembly: CLSCompliant(false)]
+            var clsAttr = root!.DescendantNodes()
+                .First(n => n is AttributeSyntax { Name: { } name } &&
+                            name.ToString() == "CLSCompliant");
+            editor.ReplaceNode(clsAttr, (n, g) =>
+            {
+                var attr = (AttributeSyntax)n;
+                var arg = attr.ArgumentList!.Arguments.First();
+                var newArg = arg.WithExpression(SyntaxFactory.LiteralExpression(SyntaxKind.FalseLiteralExpression));
+                var newAttr = attr.WithArgumentList(SyntaxFactory.AttributeArgumentList(
+                    SyntaxFactory.SeparatedList(new[] { newArg })));
+                return newAttr;
+            });
+            await Write(editor, path);
+        }
+
         private static async Task Write(DocumentEditor editor, string path)
         {
             var document = await Formatter.FormatAsync(editor.GetChangedDocument());
@@ -348,7 +406,7 @@ namespace Converter
         public async Task UpdateBuildManager()
         {
             var wrapper = new Editor();
-            var path = Path.Combine(_frameworkRoot, "BackEnd/BuildManager/BuildManager.cs");
+            var path = Path.Combine(_buildRoot, "BackEnd/BuildManager/BuildManager.cs");
             var (root, editor) = await wrapper.LoadDocument(path);
 
             var cls = root!.DescendantNodes()
@@ -382,7 +440,7 @@ namespace Converter
             })
             {
                 var wrapper = new Editor();
-                var path = Path.Combine(_frameworkRoot, shortPath);
+                var path = Path.Combine(_buildRoot, shortPath);
                 var (root, editor) = await wrapper.LoadDocument(path);
 
                 var className = Path.GetFileNameWithoutExtension(shortPath);
