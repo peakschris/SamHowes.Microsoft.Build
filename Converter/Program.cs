@@ -360,10 +360,16 @@ namespace Converter
             var _ = typeof(Microsoft.CodeAnalysis.CSharp.Formatting.CSharpFormattingOptions);
 
             var wrapper = new Editor();
-            var path = Path.Combine(_frameworkRoot, "Properties/AssemblyInfo.cs");
+            var path = Path.Combine(_srcRoot, "Deprecated/Engine/AssemblyInfo.cs");
             await DisableCLSAssemblyInfo(wrapper, path);
-            var path2 = Path.Combine(_buildRoot, "AssemblyInfo.cs");
+            var path2 = Path.Combine(_frameworkRoot, "Properties/AssemblyInfo.cs");
             await DisableCLSAssemblyInfo(wrapper, path2);
+            var path3 = Path.Combine(_srcRoot, "Shared/AssemblyLoadInfo.cs");
+            await DisableCLSAssemblyInfo(wrapper, path3);
+            var path4 = Path.Combine(_frameworkRoot, "Utilities/AssemblyInfo.cs");
+            await DisableCLSAssemblyInfo(wrapper, path4);
+            var path5 = Path.Combine(_buildRoot, "AssemblyInfo.cs");
+            await DisableCLSAssemblyInfo(wrapper, path5);
         }
 
         private async Task DisableCLSAssemblyInfo(Editor wrapper, string path)

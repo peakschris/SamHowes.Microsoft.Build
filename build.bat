@@ -1,3 +1,6 @@
+rem Start Visual Studio developer command prompt
+rem build.bat
+
 set version=vs17.11
 pushd _work\msbuild
 git checkout %version%
