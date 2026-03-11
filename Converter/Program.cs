@@ -43,6 +43,7 @@ namespace Converter
             Commit("Make methods public instead of internal");
 
             processor.SetPackageId();
+            processor.SetFrameworkPackageId();
             Commit("Set Package Id");
 
             await processor.UpdateTranslator();
@@ -59,7 +60,7 @@ namespace Converter
 
             try
             {
-                processor.SetVersion("17.11.0");
+                processor.SetVersion("18.0.13");
                 Commit("Set our version number");
             }
             catch
@@ -158,27 +159,32 @@ namespace Converter
                 (new Regex(@"^(?<indent>\s*)(?<modifier>(static|sealed|abstract|protected)\s)?internal(?<suffix>\s)(?<accessor>set)?", flags),
                     (MatchEvaluator)MakePublic),
                 (new Regex(@"(?<qualifier>System.Reflection.)?BindingFlags.NonPublic", flags),
-                    (MatchEvaluator)SearchForPublic)
+                    (MatchEvaluator)SearchForPublic),
+                // Handle property accessors like "{ get; internal set; }" - remove the internal modifier
+                (new Regex(@"\{\s*get;\s*internal\s+set;\s*\}", flags),
+                    (MatchEvaluator)(m => { replaced = true; return "{ get; set; }"; }))
             };
 
             var blockList = new HashSet<string>(new[]
             {
+                // ONLY block truly platform-specific/native types that should never be public
                 "Shared/FileSystem/WindowsNative.cs",
-                "Shared/CommunicationsUtilities.cs",
                 "Shared/NativeMethodsShared.cs",
+                "Framework/NativeMethods.cs",
+                "Framework/Polyfills/StringSyntaxAttribute.cs",
+                "Build/BackEnd/Node/NativeMethods.cs",
+
+                // Handshake infrastructure - files that expose internal handshake types (ServerNodeHandshake, Handshake, HandshakeOptions) in their public APIs
+                "Shared/NamedPipeUtil.cs",
                 "Shared/NodeEndpointOutOfProcBase.cs",
+
+                // Out-of-proc node providers - these are process boundary infrastructure
                 "Build/BackEnd/Components/Communications/NodeProviderOutOfProcTaskHost.cs",
                 "Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs",
                 "Build/BackEnd/Components/Communications/NodeProviderOutOfProc.cs",
                 "Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs",
                 "Build/BackEnd/Components/Communications/ServerNodeEndpointOutOfProc.cs",
                 "Build/BackEnd/Node/OutOfProcServerNode.cs",
-                "Build/BackEnd/Node/NativeMethods.cs",
-                "Framework/NativeMethods.cs",
-                // "Framework/ITranslator.cs",
-                // "Framework/ITranslatable.cs",
-                // "Framework/BinaryTranslator.cs",
-                // "Framework/BuildException/BuildExceptionBase.cs",
             }.Select(f => Path.Combine(_srcRoot, f)));
 
             void Walk(string directory)
@@ -234,12 +240,16 @@ namespace Converter
                 "CS0050;CS0051;CS3001;CS3002;CS3003;CS3005;CS3008;CS1573;CS3021",
                 // CLS-compliant field 'ProjectCacheService.DesignTimeBuildsDetected' cannot be volatile
                 // we're not doing designtime builds, and there is a todo in the code to remove this property anyways
-                "CS3026"
+                "CS3026",
+                // Code analysis warnings that are acceptable for our public API surface
+                "CA1401;CA1050;IDE0005",
+                // NuGet package signing trust warnings
+                "NU3018"
             });
             GetOrAddProperty("PackageId").Value = "SamHowes.Microsoft.Build";
             // GetOrAddProperty("AssemblyName").Value = "SamHowes.Microsoft.Build";
             GetOrAddProperty("EnablePackageValidation").Value = "false";
-            
+
             xml.Save();
 
             // Open the csproj as text and replace:
@@ -252,6 +262,31 @@ namespace Converter
             var regex = new Regex(@"(\s*)internal(\s+sealed\s+partial\s+class\s+NuGetFrameworkWrapper)");
             contents = regex.Replace(contents, "$1public$2");
             _files.WriteContents(path, contents);
+        }
+
+        public void SetFrameworkPackageId()
+        {
+            var xml = ProjectRootElement.Open(Path.Combine(_frameworkRoot, "Microsoft.Build.Framework.csproj"),
+                ProjectCollection.GlobalProjectCollection,
+                preserveFormatting: true)!;
+            var group = xml.PropertyGroups.First();
+
+            ProjectPropertyElement GetOrAddProperty(string name)
+            {
+                var property = xml!.Properties.FirstOrDefault(p => p.Name == name);
+                if (property == null)
+                {
+                    property = xml.CreatePropertyElement(name);
+                    group!.AppendChild(property);
+                }
+
+                return property;
+            }
+
+            GetOrAddProperty("PackageId").Value = "SamHowes.Microsoft.Build.Framework";
+            GetOrAddProperty("EnablePackageValidation").Value = "false";
+
+            xml.Save();
         }
 
         public async Task UpdateTranslator()
@@ -360,16 +395,12 @@ namespace Converter
             var _ = typeof(Microsoft.CodeAnalysis.CSharp.Formatting.CSharpFormattingOptions);
 
             var wrapper = new Editor();
-            var path = Path.Combine(_srcRoot, "Deprecated/Engine/AssemblyInfo.cs");
-            await DisableCLSAssemblyInfo(wrapper, path);
             var path2 = Path.Combine(_frameworkRoot, "Properties/AssemblyInfo.cs");
             await DisableCLSAssemblyInfo(wrapper, path2);
-            var path3 = Path.Combine(_srcRoot, "Shared/AssemblyLoadInfo.cs");
-            await DisableCLSAssemblyInfo(wrapper, path3);
-            var path4 = Path.Combine(_frameworkRoot, "Utilities/AssemblyInfo.cs");
-            await DisableCLSAssemblyInfo(wrapper, path4);
             var path5 = Path.Combine(_buildRoot, "AssemblyInfo.cs");
             await DisableCLSAssemblyInfo(wrapper, path5);
+            var path6 = Path.Combine(_srcRoot, "Utilities/AssemblyInfo.cs");
+            await DisableCLSAssemblyInfo(wrapper, path6);
         }
 
         private async Task DisableCLSAssemblyInfo(Editor wrapper, string path)
@@ -418,23 +449,29 @@ namespace Converter
             var cls = root!.DescendantNodes()
                 .First(n => n is ClassDeclarationSyntax { Identifier: { Text: "BuildManager" } });
 
+            // Make GetNewConfigurationId public if it exists
             foreach (var method in cls.DescendantNodes()
                 .OfType<MethodDeclarationSyntax>()
                 .Where(m => m.Identifier.Text == "GetNewConfigurationId"))
                 editor.SetAccessibility(method, Accessibility.Public);
 
+            // Try to find ReuseOldCaches and add an overload if it exists
             var reuseOldCaches = cls.DescendantNodes()
                 .OfType<MethodDeclarationSyntax>()
-                .Single(m => m.Identifier.Text == "ReuseOldCaches");
+                .FirstOrDefault(m => m.Identifier.Text == "ReuseOldCaches");
 
-            var newMethod = SyntaxFactory.ParseMemberDeclaration(@"
+            if (reuseOldCaches != null)
+            {
+                var newMethod = SyntaxFactory.ParseMemberDeclaration(@"
         public void ReuseOldCaches(IConfigCache configCache, IResultsCache resultsCache)
         {
             _componentFactories.ReplaceFactory(BuildComponentType.ConfigCache, configCache);
             _componentFactories.ReplaceFactory(BuildComponentType.ResultsCache, resultsCache);
         }
 ");
-            editor.InsertAfter(reuseOldCaches, newMethod!);
+                editor.InsertAfter(reuseOldCaches, newMethod!);
+            }
+
             await Write(editor, path);
         }
 
