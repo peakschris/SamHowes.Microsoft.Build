@@ -1,21 +1,32 @@
-rem Start Visual Studio developer command prompt
-rem build.bat
+@echo off
+setlocal enabledelayedexpansion
 
-set version=vs17.11
+set git_version=vs18.0
 pushd _work\msbuild
-git checkout %version%
+git checkout "%git_version%"
 git reset --hard
-git branch -D rules_msbuild/%version% || echo ""
-git checkout -b rules_msbuild/%version%
+git branch -D "rules_msbuild/%git_version%" 2>nul || echo.
+git checkout -b "rules_msbuild/%git_version%"
 popd
 
 pushd Converter
-set version=17.11.0
+echo "Running converter for git version %git_version%"
 dotnet run
+if errorlevel 1 exit /b 1
 popd
 
 pushd _work\msbuild
-set "proj=%cd%\src\Build\Microsoft.Build.csproj"
-.\build.cmd -pack -projects "%proj%" -configuration Release
+set buildProj=%cd%\src\Build\Microsoft.Build.csproj
+set frameworkProj=%cd%\src\Framework\Microsoft.Build.Framework.csproj
 
-rmdir /s /q %USERPROFILE%\.nuget\packages\samhowes.microsoft.build
+echo Building Microsoft.Build.Framework...
+call build.cmd -pack -projects "%frameworkProj%" -configuration Release /p:UsingToolVisualStudioIbcTraining=false
+if errorlevel 1 exit /b 1
+
+echo Building Microsoft.Build...
+call build.cmd -pack -projects "%buildProj%" -configuration Release /p:UsingToolVisualStudioIbcTraining=false
+if errorlevel 1 exit /b 1
+
+rmdir /s /q "%USERPROFILE%\.nuget\packages\samhowes.microsoft.build" 2>nul || echo.
+rmdir /s /q "%USERPROFILE%\.nuget\packages\samhowes.microsoft.build.framework" 2>nul || echo.
+popd
