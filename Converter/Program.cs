@@ -45,6 +45,9 @@ namespace Converter
             processor.SetPackageId();
             Commit("Set Package Id");
 
+            processor.SetFrameworkPackageId();
+            Commit("Set Framework Package Id");
+
             await processor.UpdateTranslator();
             Commit("Update binary translation for string interning");
 
@@ -59,7 +62,7 @@ namespace Converter
 
             try
             {
-                processor.SetVersion("17.11.0");
+                processor.SetVersion("18.0.11");
                 Commit("Set our version number");
             }
             catch
@@ -130,6 +133,12 @@ namespace Converter
                 var accessor = match.Groups["accessor"];
                 if (accessor.Success)
                 {
+                    // Keep matched setters internal. Emitting a bare `set` inside a now-public
+                    // property makes the setter public, which illegally widens an override of an
+                    // `internal` base setter (BuildResult.Exception over BuildResultBase.Exception)
+                    // -> CS0507. The builder reflects with BindingFlags.Public|NonPublic anyway,
+                    // so internal setters stay reachable.
+                    res.Append("internal ");
                     res.Append(accessor.Value);
                 }
                 else
@@ -204,6 +213,24 @@ namespace Converter
 
             foreach (var directory in targetDirectories)
                 Walk(directory);
+
+            // Re-internalize two static helper classes the blanket publicize over-exposed. Both
+            // are new vs18.0 backend features (RAR out-of-proc server node; extended packet
+            // headers) whose public methods take types that live in blocklisted files and stay
+            // internal (HandshakeOptions, ServerNodeHandshake in Shared/CommunicationsUtilities.cs).
+            // Publicizing the class turned those methods truly public -> CS0051 inconsistent
+            // accessibility. The builder consumes neither, so keeping the classes internal is
+            // faithful and avoids cascading the interop Handshake* family into the public surface.
+            void ReInternalizeClass(string relativeFile, string decl)
+            {
+                var path = Path.Combine(_srcRoot, relativeFile);
+                var contents = _files.GetContents(path);
+                contents = contents.Replace("public " + decl, "internal " + decl);
+                _files.WriteContents(path, contents);
+            }
+
+            ReInternalizeClass("Shared/INodePacket.cs", "static class NodePacketTypeExtensions");
+            ReInternalizeClass("Shared/NamedPipeUtil.cs", "static class NamedPipeUtil");
         }
 
         public void SetPackageId()
@@ -234,7 +261,10 @@ namespace Converter
                 "CS0050;CS0051;CS3001;CS3002;CS3003;CS3005;CS3008;CS1573;CS3021",
                 // CLS-compliant field 'ProjectCacheService.DesignTimeBuildsDetected' cannot be volatile
                 // we're not doing designtime builds, and there is a todo in the code to remove this property anyways
-                "CS3026"
+                "CS3026",
+                // missing XML doc comments on members exposed by publicizing internals
+                // (GenerateDocumentationFile=true in src/Directory.Build.props)
+                "CS1591"
             });
             GetOrAddProperty("PackageId").Value = "SamHowes.Microsoft.Build";
             // GetOrAddProperty("AssemblyName").Value = "SamHowes.Microsoft.Build";
@@ -252,6 +282,46 @@ namespace Converter
             var regex = new Regex(@"(\s*)internal(\s+sealed\s+partial\s+class\s+NuGetFrameworkWrapper)");
             contents = regex.Replace(contents, "$1public$2");
             _files.WriteContents(path, contents);
+        }
+
+        public void SetFrameworkPackageId()
+        {
+            var xml = ProjectRootElement.Open(Path.Combine(_frameworkRoot, "Microsoft.Build.Framework.csproj"),
+                ProjectCollection.GlobalProjectCollection,
+                preserveFormatting: true)!;
+            var group = xml.PropertyGroups.First();
+
+            ProjectPropertyElement GetOrAddProperty(string name)
+            {
+                var property = xml!.Properties.FirstOrDefault(p => p.Name == name);
+                if (property == null)
+                {
+                    property = xml.CreatePropertyElement(name);
+                    group!.AppendChild(property);
+                }
+
+                return property;
+            }
+
+            var noWarn = GetOrAddProperty("NoWarn");
+            noWarn.Value = string.Join(";", new[]
+            {
+                // The Framework csproj has no own NoWarn, so GetOrAddProperty creates an empty one.
+                // Seed it with $(NoWarn) so the root Directory.Build.props suppressions (notably
+                // SYSLIB0037) are still inherited instead of being overwritten by this element.
+                string.IsNullOrEmpty(noWarn.Value) ? "$(NoWarn)" : noWarn.Value,
+                // CLS-compliance and naming warnings from making internal members public
+                "CS0050;CS0051;CS3001;CS3002;CS3003;CS3005;CS3008;CS1573;CS3021;CS3026",
+                // IDE style-as-error from EnforceCodeStyleInBuild=true in src/Directory.Build.props
+                "IDE0040;IDE0051",
+                // missing XML doc on publicized members; obsolete AssemblyName.ProcessorArchitecture
+                // (also inherited via $(NoWarn) above, listed explicitly for robustness)
+                "CS1591;SYSLIB0037",
+            });
+            GetOrAddProperty("PackageId").Value = "SamHowes.Microsoft.Build.Framework";
+            GetOrAddProperty("EnablePackageValidation").Value = "false";
+
+            xml.Save();
         }
 
         public async Task UpdateTranslator()
@@ -361,13 +431,14 @@ namespace Converter
 
             var wrapper = new Editor();
             var path = Path.Combine(_srcRoot, "Deprecated/Engine/AssemblyInfo.cs");
-            await DisableCLSAssemblyInfo(wrapper, path);
+            if (File.Exists(path))
+                await DisableCLSAssemblyInfo(wrapper, path);
             var path2 = Path.Combine(_frameworkRoot, "Properties/AssemblyInfo.cs");
             await DisableCLSAssemblyInfo(wrapper, path2);
-            var path3 = Path.Combine(_srcRoot, "Shared/AssemblyLoadInfo.cs");
-            await DisableCLSAssemblyInfo(wrapper, path3);
+            // path3 (Shared/AssemblyLoadInfo.cs) removed — it is a class file (no [assembly: CLSCompliant])
             var path4 = Path.Combine(_frameworkRoot, "Utilities/AssemblyInfo.cs");
-            await DisableCLSAssemblyInfo(wrapper, path4);
+            if (File.Exists(path4))
+                await DisableCLSAssemblyInfo(wrapper, path4);
             var path5 = Path.Combine(_buildRoot, "AssemblyInfo.cs");
             await DisableCLSAssemblyInfo(wrapper, path5);
         }
@@ -409,33 +480,43 @@ namespace Converter
             versionsProps.Save(path);
         }
 
-        public async Task UpdateBuildManager()
+        public Task UpdateBuildManager()
         {
-            var wrapper = new Editor();
+            // BuildManager.cs in vs18.0 uses C# 12 collection-expression syntax (e.g. `?? []`)
+            // that Roslyn 3.10.0 (net6.0 target) cannot parse: the syntax tree produced for the
+            // class body is malformed, causing DescendantNodes().OfType<MethodDeclarationSyntax>()
+            // to find zero results for methods that physically exist in the file.
+            // Use Files-based text edits instead (same pattern as SetPackageId's regex fallback).
             var path = Path.Combine(_buildRoot, "BackEnd/BuildManager/BuildManager.cs");
-            var (root, editor) = await wrapper.LoadDocument(path);
+            var contents = _files.GetContents(path);
 
-            var cls = root!.DescendantNodes()
-                .First(n => n is ClassDeclarationSyntax { Identifier: { Text: "BuildManager" } });
+            // 1. Make GetNewConfigurationId public — builder.dll calls it directly.
+            //    Publicize() only promotes `internal` → `public`; this method is private.
+            contents = contents.Replace(
+                "private int GetNewConfigurationId()",
+                "public int GetNewConfigurationId()");
 
-            foreach (var method in cls.DescendantNodes()
-                .OfType<MethodDeclarationSyntax>()
-                .Where(m => m.Identifier.Text == "GetNewConfigurationId"))
-                editor.SetAccessibility(method, Accessibility.Public);
+            // 2. Insert a public ReuseOldCaches(IConfigCache, IResultsCache) overload so
+            //    builder.dll can inject its own caches without needing InputResultsCacheFiles.
+            //    Anchor: the next method that follows private bool ReuseOldCaches(string[]).
+            const string logMessageSig = "private void LogMessage(string message)";
+            var insertAt = contents.IndexOf(logMessageSig, StringComparison.Ordinal);
+            if (insertAt < 0)
+                throw new InvalidOperationException("Cannot find LogMessage anchor in BuildManager.cs");
 
-            var reuseOldCaches = cls.DescendantNodes()
-                .OfType<MethodDeclarationSyntax>()
-                .Single(m => m.Identifier.Text == "ReuseOldCaches");
-
-            var newMethod = SyntaxFactory.ParseMemberDeclaration(@"
-        public void ReuseOldCaches(IConfigCache configCache, IResultsCache resultsCache)
-        {
-            _componentFactories.ReplaceFactory(BuildComponentType.ConfigCache, configCache);
-            _componentFactories.ReplaceFactory(BuildComponentType.ResultsCache, resultsCache);
-        }
-");
-            editor.InsertAfter(reuseOldCaches, newMethod!);
-            await Write(editor, path);
+            // The 8-space indentation prefix before `private void LogMessage` already exists in
+            // the file at insertAt; newOverload reuses those bytes as the indent for `public void`,
+            // then provides its own blank line + 8-space prefix before `private void LogMessage`.
+            const string newOverload =
+                "public void ReuseOldCaches(IConfigCache configCache, IResultsCache resultsCache)\n" +
+                "        {\n" +
+                "            _componentFactories.ReplaceFactory(BuildComponentType.ConfigCache, configCache);\n" +
+                "            _componentFactories.ReplaceFactory(BuildComponentType.ResultsCache, resultsCache);\n" +
+                "        }\n\n" +
+                "        ";
+            contents = contents.Insert(insertAt, newOverload);
+            _files.WriteContents(path, contents);
+            return Task.CompletedTask;
         }
 
         public async Task UpdateResultsCache()

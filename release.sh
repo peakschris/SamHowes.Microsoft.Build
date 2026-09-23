@@ -3,11 +3,14 @@
 set -e
 if [[ ! -f .gitignore ]]; then echo >&2 "not at root"; exit 1; fi
 
-version="0.0.2"
-msbuild_version="17.0.0"
+version="v18.0.11a"
+msbuild_version="18.0.11"
 msbuild_root="$(realpath "$(pwd)/_work/msbuild")"
 configuration="Release"
-artifacts=( "$msbuild_root/artifacts/packages/$configuration/Shipping/SamHowes.Microsoft.Build.$msbuild_version.nupkg" )
+artifacts=(
+    "$msbuild_root/artifacts/packages/$configuration/Shipping/SamHowes.Microsoft.Build.$msbuild_version.nupkg"
+    "$msbuild_root/artifacts/packages/$configuration/Shipping/SamHowes.Microsoft.Build.Framework.$msbuild_version.nupkg"
+)
 
 gh_args=()
 echo "checking artifacts..."
