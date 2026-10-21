@@ -42,6 +42,9 @@ namespace Converter
             processor.Publicize();
             Commit("Make methods public instead of internal");
 
+            processor.BundleTaskHostAssemblies();
+            Commit("Bundle Utilities.Core and Tasks.Core into the package");
+
             processor.SetPackageId();
             Commit("Set Package Id");
 
@@ -56,6 +59,12 @@ namespace Converter
 
             await processor.UpdateResultsCache();
             Commit("Allow overriding of methods in the results cache");
+
+            processor.UpdateTypeLoader();
+            Commit("Run same-runtime task-host tasks in-process");
+
+            processor.UpdateAssemblyTaskFactory();
+            Commit("Run same-runtime TaskHostFactory tasks in-process (factory decision)");
 
             await processor.DisableCLS();
             Commit("Disable CLS compliance");
@@ -282,6 +291,44 @@ namespace Converter
             var regex = new Regex(@"(\s*)internal(\s+sealed\s+partial\s+class\s+NuGetFrameworkWrapper)");
             contents = regex.Replace(contents, "$1public$2");
             _files.WriteContents(path, contents);
+        }
+
+        // MUST run before SetPackageId: this opens Microsoft.Build.csproj via the shared
+        // GlobalProjectCollection, and SetPackageId finishes with a TEXT-level regex (internal ->
+        // public for the inline NuGetFrameworkWrapper CDATA) that is not reflected in the cached DOM.
+        // If this ran after SetPackageId, saving the stale cached DOM here would revert that public
+        // conversion and the net472 Build would fail with CS0262.
+        public void BundleTaskHostAssemblies()
+        {
+            // The builder runs ILLink/trimmer/AOT tasks IN-PROCESS (see UpdateTypeLoader), so the .NET
+            // runtime must find their base class Microsoft.Build.Utilities.Task -> i.e.
+            // Microsoft.Build.Utilities.Core.dll must sit next to builder.dll, or the task cannot be
+            // loaded (MSB4062). Neither the SDK nor a stock NuGet package ships a copy whose identity
+            // matches this forked Microsoft.Build.Framework (18.0.11), so bundle the fork-built
+            // Utilities.Core (built by build.bat just before the pack) into this package's lib/net10.0.
+            // It then flows to the builder publish dir via the existing SamHowes.Microsoft.Build
+            // PackageReference in rules_msbuild's Builder.csproj. EnablePackageValidation is already off
+            // (SetPackageId), so shipping an extra assembly in lib does not trip package validation.
+            // (Tasks.Core is deliberately not bundled: the ILLink tasks derive from Utilities.Task, not
+            // from Tasks.Core, and Tasks.csproj cannot be built from the publicized tree without CS0121.)
+            var path = Path.Combine(_buildRoot, "Microsoft.Build.csproj");
+            var xml = ProjectRootElement.Open(path, ProjectCollection.GlobalProjectCollection,
+                preserveFormatting: true)!;
+            var itemGroup = xml.AddItemGroup();
+
+            void AddBundled(string projectName, string assemblyFileName)
+            {
+                // Arcade output layout: artifacts/bin/<ProjectName>/<Configuration>/<TFM>/<AssemblyName>.dll
+                var include = $@"$(ArtifactsBinDir){projectName}\$(Configuration)\net10.0\{assemblyFileName}";
+                var item = itemGroup.AddItem("None", include);
+                item.AddMetadata("Pack", "true");
+                item.AddMetadata("PackagePath", "lib/net10.0");
+                item.AddMetadata("Visible", "false");
+            }
+
+            AddBundled("Microsoft.Build.Utilities", "Microsoft.Build.Utilities.Core.dll");
+
+            xml.Save();
         }
 
         public void SetFrameworkPackageId()
@@ -545,6 +592,67 @@ namespace Converter
 
                 await Write(editor, path);
             }
+        }
+
+        public void UpdateTypeLoader()
+        {
+            // Run same-runtime/arch TaskHostFactory tasks (ILLink/trimmer/AOT) IN-PROCESS instead of
+            // spawning the SDK out-of-proc task host. The SDK declares these tasks with
+            // TaskFactory="TaskHostFactory" (so useTaskHost is always true), which forces the
+            // out-of-proc path. That path is incompatible with the rules_msbuild builder's hermetic
+            // PathMapper: the task-host IPC receives exec-root paths tokenized to $exec_root, which the
+            // child task-host process cannot resolve -> MSB4027/MSB4181. Dropping the `useTaskHost ||`
+            // term leaves the decision to !taskHostParamsMatchCurrentProc, so a genuine runtime/arch
+            // mismatch still goes out-of-proc (correct), while same-runtime tasks load in-process.
+            // This governs TYPE LOADING (real type vs reflection-only MetadataLoadContext); the actual
+            // in-proc-vs-task-host RUN decision lives in AssemblyTaskFactory and is patched by
+            // UpdateAssemblyTaskFactory below. Both are required: without the factory patch the engine
+            // loads the real task type here but still builds a TaskHostTask proxy, so output marshaling
+            // mismatches (MSB4028 "ComputeManagedAssemblies does not match target type TaskHostTask").
+            var path = Path.Combine(_sharedRoot, "TypeLoader.cs");
+            var contents = _files.GetContents(path);
+            const string original =
+                "(useTaskHost || !taskHostParamsMatchCurrentProc) && _assemblyLoadInfo.AssemblyFile is not null;";
+            const string patched =
+                "(!taskHostParamsMatchCurrentProc) && _assemblyLoadInfo.AssemblyFile is not null;";
+            if (!contents.Contains(original))
+                throw new InvalidOperationException(
+                    "Cannot find ShouldUseMetadataLoadContext expression in TypeLoader.cs to patch.");
+            contents = contents.Replace(original, patched);
+            _files.WriteContents(path, contents);
+        }
+
+        public void UpdateAssemblyTaskFactory()
+        {
+            // Companion to UpdateTypeLoader: make AssemblyTaskFactory.CreateTaskInstance RUN
+            // TaskHostFactory tasks in-process when their runtime/arch match the current process,
+            // instead of constructing a TaskHostTask out-of-proc proxy. The SDK declares ILLink/AOT
+            // tasks with TaskFactory="TaskHostFactory" (_taskHostFactoryExplicitlyRequested = true),
+            // which otherwise forces the out-of-proc path -- incompatible with the builder's hermetic
+            // PathMapper (MSB4181/MSB4028). Dropping the explicit-request term leaves the decision to
+            // whether the task host parameters match the current process, so a genuine runtime/arch
+            // mismatch still goes out-of-proc, while same-runtime tasks (ILLink) run in-process.
+            var path = Path.Combine(_buildRoot, "Instance/TaskFactories/AssemblyTaskFactory.cs");
+            var contents = _files.GetContents(path);
+
+            // Case 1: identity params present -> decide purely on the parameter/current-process match.
+            const string withParamsOriginal =
+                "useTaskFactory = _taskHostFactoryExplicitlyRequested || !TaskHostParametersMatchCurrentProcess(mergedParameters);";
+            const string withParamsPatched =
+                "useTaskFactory = !TaskHostParametersMatchCurrentProcess(mergedParameters);";
+            // Case 2: no identity params -> implicitly current process, so run in-process.
+            const string noParamsOriginal =
+                "useTaskFactory = _taskHostFactoryExplicitlyRequested;";
+            const string noParamsPatched =
+                "useTaskFactory = false;";
+
+            if (!contents.Contains(withParamsOriginal) || !contents.Contains(noParamsOriginal))
+                throw new InvalidOperationException(
+                    "Cannot find useTaskFactory assignments in AssemblyTaskFactory.cs to patch.");
+
+            contents = contents.Replace(withParamsOriginal, withParamsPatched);
+            contents = contents.Replace(noParamsOriginal, noParamsPatched);
+            _files.WriteContents(path, contents);
         }
     }
 
